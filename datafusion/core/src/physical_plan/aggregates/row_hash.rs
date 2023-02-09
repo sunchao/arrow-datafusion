@@ -585,20 +585,22 @@ impl GroupedHashAggregateStream {
             return Ok(Some(RecordBatch::new_empty(schema)));
         }
 
-        // Buffers for each distinct group (i.e. row accumulator memories)
-        let mut state_buffers = group_state_chunk
-            .iter()
-            .map(|gs| gs.aggregation_buffer.clone())
-            .collect::<Vec<_>>();
-
         let output_fields = self.schema.fields();
         // Store row accumulator results (either final output or intermediate state):
         let row_columns = match self.mode {
             AggregateMode::Partial => {
+                let mut state_buffers = group_state_chunk
+                    .iter()
+                    .map(|gs| &gs.aggregation_buffer[..])
+                    .collect::<Vec<_>>();
                 read_as_batch(&state_buffers, &self.row_aggr_schema, RowType::WordAligned)
             }
             AggregateMode::Final | AggregateMode::FinalPartitioned => {
                 let mut results = vec![];
+                let mut state_buffers = group_state_chunk
+                    .iter()
+                    .map(|gs| gs.aggregation_buffer.clone())
+                    .collect::<Vec<_>>();
                 for (idx, acc) in self.row_accumulators.iter().enumerate() {
                     let mut state_accessor =
                         RowAccessor::new(&self.row_aggr_schema, RowType::WordAligned);
@@ -688,7 +690,7 @@ impl GroupedHashAggregateStream {
     }
 }
 
-fn read_as_batch(rows: &[Vec<u8>], schema: &Schema, row_type: RowType) -> Vec<ArrayRef> {
+fn read_as_batch(rows: &[&[u8]], schema: &Schema, row_type: RowType) -> Vec<ArrayRef> {
     let row_num = rows.len();
     let mut output = MutableRecordBatch::new(row_num, Arc::new(schema.clone()));
     let mut row = RowReader::new(schema, row_type);
