@@ -26,6 +26,11 @@ use primitive::GroupValuesPrimitive;
 mod row;
 use row::GroupValuesRows;
 
+mod ordered_row;
+use ordered_row::OrderedGroupValuesRows;
+
+use super::order::GroupOrdering;
+
 /// An interning store for group keys
 pub trait GroupValues: Send {
     /// Calculates the `groups` for each input row of `cols`
@@ -44,7 +49,10 @@ pub trait GroupValues: Send {
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
 }
 
-pub fn new_group_values(schema: SchemaRef) -> Result<Box<dyn GroupValues>> {
+pub(crate) fn new_group_values(
+    schema: SchemaRef,
+    ordering: &GroupOrdering,
+) -> Result<Box<dyn GroupValues>> {
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
@@ -60,5 +68,10 @@ pub fn new_group_values(schema: SchemaRef) -> Result<Box<dyn GroupValues>> {
         }
     }
 
-    Ok(Box::new(GroupValuesRows::try_new(schema)?))
+    let result: Box<dyn GroupValues> = match ordering {
+        GroupOrdering::None => Box::new(GroupValuesRows::try_new(schema)?),
+        _ => Box::new(OrderedGroupValuesRows::try_new(schema)?),
+    };
+
+    Ok(result)
 }
