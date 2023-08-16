@@ -181,7 +181,7 @@ impl GroupValues for GroupValuesRows {
                         self.hash_table[ht_offset] = self.hashes.len() + 1;
                         // also update hash for this slot so it can be used later
                         self.hashes.push(hash);
-                    } else if self.hashes[offset as usize - 1] == hash {
+                    } else if self.hashes[offset - 1] == hash {
                         // slot is not empty, and hash value match, now need to do equality
                         // check
                         self.need_equality_check[n_need_equality_check] = row_idx;
@@ -375,7 +375,7 @@ impl GroupValuesRows {
             for i in 0..self.capacity {
                 let offset = *table_ptr.add(i);
                 if offset != 0 {
-                    let hash = *hashes_ptr.add(offset as usize - 1);
+                    let hash = *hashes_ptr.add(offset - 1);
 
                     let mut new_idx = hash as usize & new_bit_mask;
                     let mut num_iter = 0;
