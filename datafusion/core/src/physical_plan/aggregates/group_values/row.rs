@@ -43,6 +43,8 @@ pub struct GroupValuesRows {
     /// The current capacity of [`Self.map`]
     capacity: usize,
 
+    count: usize,
+
     /// `group_values[i]` holds the group value for group_index `i`.
     ///
     /// The row format is used to compare group keys quickly and store
@@ -84,7 +86,7 @@ pub struct GroupValuesRows {
 
 /// Load factor of this hash table, rehash will be triggered when this is reached.
 const LOAD_FACTOR: f64 = 1.5;
-const INITIAL_CAPACITY: usize = 8192;
+const INITIAL_CAPACITY: usize = 128;
 
 impl GroupValues for GroupValuesRows {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
@@ -131,7 +133,7 @@ impl GroupValues for GroupValuesRows {
 
         // reserve beforehand, so we can operate on the raw pointer later, without worring about
         // resizing.
-        // self.hashes.reserve(n_rows);
+        self.hashes.reserve(n_rows);
 
         // reserve enough space for the auxillary data structures
         self.new_entries.resize(n_rows, 0);
@@ -157,42 +159,57 @@ impl GroupValues for GroupValuesRows {
         // For the elements in `no_match`, we'll use a loop to do linear probing. They become the
         // `selection_vector` for the next iteration.
         while remaining_entries > 0 {
+            let current_hashes_ptr = self.current_hashes.as_ptr();
+            let current_offsets_ptr = self.current_offsets.as_ptr();
+
+            // `hash_table` should have enough space for new elements, since we've done
+            // `rehash` at this point
+            let hash_table_ptr = self.hash_table.as_mut_ptr();
+            let new_entries_ptr = self.new_entries.as_mut_ptr();
+            let need_equality_check_ptr = self.need_equality_check.as_mut_ptr();
+            let no_match_ptr = self.no_match.as_mut_ptr();
+            let hashes_ptr = self.hashes.as_mut_ptr();
+
             let mut n_new_entries = 0;
             let mut n_need_equality_check = 0;
             let mut n_no_match = 0;
 
-            selection_vector
-                .iter()
-                .take(remaining_entries)
-                .for_each(|row_idx| {
-                    let row_idx = *row_idx;
-                    let hash = self.current_hashes[row_idx];
-                    let ht_offset = self.current_offsets[row_idx];
-                    let offset = self.hash_table[ht_offset];
+            unsafe {
+                selection_vector
+                    .iter()
+                    .take(remaining_entries)
+                    .for_each(|row_idx| {
+                        let row_idx = *row_idx;
+                        let hash = *current_hashes_ptr.add(row_idx);
+                        let ht_offset = *current_offsets_ptr.add(row_idx);
+                        let offset = *hash_table_ptr.add(ht_offset);
 
-                    if offset == 0 {
-                        // the slot is empty, so we can create a new entry here
-                        self.new_entries[n_new_entries] = row_idx;
-                        n_new_entries += 1;
+                        if offset == 0 {
+                            // the slot is empty, so we can create a new entry here
+                            *new_entries_ptr.add(n_new_entries) = row_idx;
+                            n_new_entries += 1;
 
-                        // we increment the slot entry offset by 1 to reserve the special value
-                        // 0 for the scenario when the slot in the
-                        // hash table is unoccupied.
-                        self.hash_table[ht_offset] = self.hashes.len() + 1;
-                        // also update hash for this slot so it can be used later
-                        self.hashes.push(hash);
-                    } else if self.hashes[offset - 1] == hash {
-                        // slot is not empty, and hash value match, now need to do equality
-                        // check
-                        self.need_equality_check[n_need_equality_check] = row_idx;
-                        n_need_equality_check += 1;
-                    } else {
-                        // slot is not empty, and hash value doesn't match, we have a hash
-                        // collision and need to do probing
-                        self.no_match[n_no_match] = row_idx;
-                        n_no_match += 1;
-                    }
-                });
+                            // we increment the slot entry offset by 1 to reserve the special value
+                            // 0 for the scenario when the slot in the
+                            // hash table is unoccupied.
+                            *hash_table_ptr.add(ht_offset) = self.count + 1;
+                            // also update hash for this slot so it can be used later
+                            *hashes_ptr.add(self.count) = hash;
+                            self.count += 1;
+                        } else if *hashes_ptr.add(offset - 1) == hash {
+                            // slot is not empty, and hash value match, now need to do equality
+                            // check
+                            *need_equality_check_ptr.add(n_need_equality_check) = row_idx;
+                            n_need_equality_check += 1;
+                        } else {
+                            // slot is not empty, and hash value doesn't match, we have a hash
+                            // collision and need to do probing
+                            *no_match_ptr.add(n_no_match) = row_idx;
+                            n_no_match += 1;
+                        }
+                    });
+                self.hashes.set_len(self.count);
+            }
 
             self.process_new_entries(n_new_entries, &group_rows);
 
@@ -256,21 +273,6 @@ impl GroupValues for GroupValuesRows {
                     new_group_values.push(row);
                 }
                 std::mem::swap(&mut new_group_values, &mut self.group_values);
-
-                // Removes the first n elements from the hashes
-                self.hashes.drain(0..n);
-
-                // Also update hash table and clear out emitted entries
-                for i in 0..self.hash_table.len() {
-                    let ht_offset = self.hash_table[i];
-                    if ht_offset > 0 {
-                        match ht_offset.checked_sub(n + 1) {
-                            Some(sub) => self.hash_table[i] = sub + 1,
-                            None => self.hash_table[i] = 0,
-                        }
-                    }
-                }
-
                 output
             }
         };
@@ -299,6 +301,7 @@ impl GroupValuesRows {
             hashes: Vec::with_capacity(INITIAL_CAPACITY),
             group_values,
             has_emitted: false,
+            count: 0,
             current_hashes: Default::default(),
             random_state: Default::default(),
             current_offsets: Default::default(),
@@ -330,19 +333,23 @@ impl GroupValuesRows {
         n_need_equality_check: usize,
         n_no_match: &mut usize,
     ) {
+        let hash_table_ptr = self.hash_table.as_ptr();
+        let current_offsets_ptr = self.current_offsets.as_ptr();
+        let no_match_ptr = self.no_match.as_mut_ptr();
+
         self.need_equality_check
             .iter()
             .take(n_need_equality_check)
-            .for_each(|row_idx| {
+            .for_each(|row_idx| unsafe {
                 let row_idx = *row_idx;
-                let ht_offset = self.current_offsets[row_idx];
-                let offset = self.hash_table[ht_offset];
+                let ht_offset = *current_offsets_ptr.add(row_idx);
+                let offset = *hash_table_ptr.add(ht_offset);
 
                 let existing = self.group_values.row(offset - 1);
                 let incoming = group_rows.row(row_idx);
 
                 if existing != incoming {
-                    self.no_match[*n_no_match] = row_idx;
+                    *no_match_ptr.add(*n_no_match) = row_idx;
                     *n_no_match += 1;
                 }
             });
