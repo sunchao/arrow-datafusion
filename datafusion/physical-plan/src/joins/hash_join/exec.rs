@@ -1184,10 +1184,6 @@ impl HashJoinExec {
              Optimizer rules that reorder join inputs must run before optimizer rules `FilterPushdown::new_post_optimization()`"
         );
 
-        assert_or_internal_err!(
-            self.prepared_build.is_none(),
-            "Cannot swap a prepared hash join"
-        );
         let left = self.left();
         let right = self.right();
         let new_join = self
@@ -1552,7 +1548,7 @@ impl ExecutionPlan for HashJoinExec {
                         Arc::clone(context.session_config().options()),
                         self.null_equality,
                         array_map_created_count,
-                        None,
+                        false,
                     ))
                 })?,
                 PartitionMode::Partitioned => {
@@ -1574,7 +1570,7 @@ impl ExecutionPlan for HashJoinExec {
                         Arc::clone(context.session_config().options()),
                         self.null_equality,
                         array_map_created_count,
-                        None,
+                        false,
                     ))
                 }
                 PartitionMode::Auto => {
@@ -2297,7 +2293,7 @@ fn should_collect_min_max_for_perfect_hash(
 #[expect(clippy::too_many_arguments)]
 async fn collect_left_input(
     random_state: RandomState,
-    left_stream: SendableRecordBatchStream,
+    mut left_stream: SendableRecordBatchStream,
     on_left: Vec<PhysicalExprRef>,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
@@ -2307,14 +2303,14 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
-    prepared_input_bytes: Option<usize>,
+    prepared: bool,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
     let should_collect_min_max_for_phj =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
 
-    let initial = BuildSideState::try_new(
+    let mut state = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
@@ -2322,32 +2318,38 @@ async fn collect_left_input(
         should_compute_dynamic_filters || should_collect_min_max_for_phj,
     )?;
 
-    let state = left_stream
-        .try_fold(initial, |mut state, batch| async move {
-            // Update accumulators if computing bounds
-            if let Some(ref mut accumulators) = state.bounds_accumulators {
-                for accumulator in accumulators {
-                    accumulator.update_batch(&batch)?;
-                }
+    let mut concat_values = if prepared {
+        vec![0; schema.fields().len()]
+    } else {
+        vec![]
+    };
+    while let Some(batch) = left_stream.try_next().await? {
+        if prepared {
+            prepared::check_byte_concat_sizes(&batch, &mut concat_values)?;
+        }
+        if let Some(accumulators) = &mut state.bounds_accumulators {
+            for accumulator in accumulators {
+                accumulator.update_batch(&batch)?;
             }
-
-            // Decide if we spill or not
-            let batch_size = state.memory_counter.count_batch(&batch);
-            // Reserve memory for incoming batch
-            if prepared_input_bytes.is_none() {
-                state.reservation.try_grow(batch_size)?;
-            }
-            // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
-            state.metrics.build_input_batches.add(1);
-            state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
-            state.num_rows += batch.num_rows();
-            // Push batch to output
-            state.batches.push(batch);
-            Ok(state)
-        })
-        .await?;
+        }
+        let batch_size = state.memory_counter.count_batch(&batch);
+        state.reservation.try_grow(batch_size)?;
+        state.metrics.build_mem_used.add(batch_size);
+        state.metrics.build_input_batches.add(1);
+        state.metrics.build_input_rows.add(batch.num_rows());
+        state.num_rows += batch.num_rows();
+        state.batches.push(batch);
+    }
+    drop(left_stream);
+    if prepared && state.batches.is_empty() {
+        // Even empty UTF-8 output retains an offset buffer.
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        state
+            .reservation
+            .try_grow(state.memory_counter.count_batch(&empty))?;
+        state.batches.push(empty);
+    }
+    let input_bytes = state.memory_counter.memory_usage();
 
     // Bind the reservation first so error paths release allocations before their charge.
     let BuildSideState {
@@ -2361,7 +2363,7 @@ async fn collect_left_input(
 
     // Admit concatenation copies while the original batches are retained.
     // Arrow keeps a single batch as an inexpensive slice.
-    let copy_bytes = if prepared_input_bytes.is_some() && batches.len() > 1 {
+    let copy_bytes = if prepared && batches.len() > 1 {
         let bytes = batches.iter().try_fold(0usize, |total, batch| {
             total
                 .checked_add(prepared::prepared_copy_bytes(batch)?)
@@ -2413,7 +2415,7 @@ async fn collect_left_input(
             // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
             // `u64` indice variant
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            if prepared_input_bytes.is_some() {
+            if prepared {
                 // new_join_hashmap accounts for buckets but not its row-index chain.
                 let index_width = if num_rows > u32::MAX as usize {
                     size_of::<u64>()
@@ -2442,7 +2444,7 @@ async fn collect_left_input(
             };
 
             let scratch_reservation = reservation.new_empty();
-            let mut hashes_buffer = if prepared_input_bytes.is_some() {
+            let mut hashes_buffer = if prepared {
                 let rows = batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0);
                 // Combining nullable keys can hold an old and a new validity
                 // bitmap at once. NullArray also materializes logical validity.
@@ -2556,7 +2558,7 @@ async fn collect_left_input(
         bounds = None;
     }
 
-    if let Some(input_bytes) = prepared_input_bytes {
+    if prepared {
         drop(batches);
         let retained = RecordBatchMemoryCounter::new().count_batch(&batch);
         let allowance = input_bytes.checked_add(copy_bytes).ok_or_else(|| {
