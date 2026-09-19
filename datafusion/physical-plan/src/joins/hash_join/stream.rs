@@ -556,8 +556,8 @@ impl HashJoinStream {
 
         let pushdown = left_data.membership().clone();
         let bounds = left_data
-            .bounds
-            .clone()
+            .bounds()
+            .cloned()
             .unwrap_or_else(|| PartitionBounds::new(vec![]));
         // Arrow tracks null counts per array, so this costs no data scan.
         let keys_have_null = left_data
